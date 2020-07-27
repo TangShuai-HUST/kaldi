@@ -36,10 +36,18 @@ namespace nnet3 {
 struct ChainObjectiveInfo {
   double tot_weight;
   double tot_like;
-  double tot_l2_term;
+  BaseFloat objf_scale;
+  std::vector<BaseFloat> aux_objf_scales;
+
+  ObjectiveValues tot_aux_objfs;
   ChainObjectiveInfo(): tot_weight(0.0),
                         tot_like(0.0),
-                        tot_l2_term(0.0) { }
+                        objf_scale(1.0) { }
+
+  ChainObjectiveInfo(BaseFloat objf_scale, 
+                     const std::vector<BaseFloat> &aux_objf_scales):
+      tot_weight(0.0), tot_like(0.0),
+      objf_scale(objf_scale), aux_objf_scales(aux_objf_scales) { }
 };
 
 
@@ -69,6 +77,7 @@ class NnetChainComputeProb {
                        const fst::StdVectorFst &den_fst,
                        Nnet *nnet);
 
+  void ParseObjectiveOpts(const chain::ChainTrainingOptions &chain_config);
 
   // Reset the likelihood stats, and the derivative stats (if computed).
   void Reset();
@@ -76,12 +85,20 @@ class NnetChainComputeProb {
   // compute objective on one minibatch.
   void Compute(const NnetChainExample &chain_eg);
 
+  // compute objective on one minibatch.
+  // void Compute(const NnetExample &eg);
+
   // Prints out the final stats, and return true if there was a nonzero count.
   bool PrintTotalStats() const;
 
   // returns the objective-function info for this output name (e.g. "output"),
   // or NULL if there is no such info.
   const ChainObjectiveInfo *GetObjective(const std::string &output_name) const;
+
+  // This function returns the total objective over all output nodes recorded here, and
+  // outputs to 'tot_weight' the total weight (typically the number of frames)
+  // corresponding to it.
+  double GetTotalObjective(double *tot_weight) const;
 
   // if config.compute_deriv == true, returns a reference to the
   // computed derivative.  Otherwise crashes.
@@ -91,6 +108,9 @@ class NnetChainComputeProb {
  private:
   void ProcessOutputs(const NnetChainExample &chain_eg,
                       NnetComputer *computer);
+
+  // void ProcessOutputs(const NnetExample &chain_eg,
+  //                     NnetComputer *computer);
 
   NnetComputeProbOptions nnet_config_;
   chain::ChainTrainingOptions chain_config_;
@@ -103,6 +123,12 @@ class NnetChainComputeProb {
 
   unordered_map<std::string, ChainObjectiveInfo, StringHasher> objf_info_;
 
+  CuArray<int32> sil_indices_;
+
+  unordered_map<std::string, BaseFloat, StringHasher> smbr_factors_;
+  unordered_map<std::string, BaseFloat, StringHasher> mmi_factors_;
+  unordered_map<std::string, BaseFloat, StringHasher> ml_factors_;
+  unordered_map<std::string, BaseFloat, StringHasher> kl_factors_;
 };
 
 /// This function zeros the stored component-level stats in the nnet using
@@ -114,6 +140,10 @@ void RecomputeStats(const std::vector<NnetChainExample> &egs,
                     const fst::StdVectorFst &den_fst,
                     Nnet *nnet);
 
+//void RecomputeStats(const std::vector<NnetExample> &egs,
+//                    const chain::ChainTrainingOptions &chain_config,
+//                    const fst::StdVectorFst &den_fst,
+//                    Nnet *nnet);
 
 
 } // namespace nnet3

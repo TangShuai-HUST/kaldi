@@ -50,9 +50,13 @@ struct NnetChainSupervision {
   /// Be careful about the order of these indexes-- it is a little confusing.
   /// The indexes in the 'index' vector are ordered as: (frame 0 of each sequence);
   /// (frame 1 of each sequence); and so on.  But in the 'supervision' object,
-  /// the FST contains (sequence 0; sequence 1; ...).  So reordering is needed.
-  /// This is done for efficiency in the denominator computation (it helps memory
-  /// locality), as well as to match the ordering inside the neural net.
+  /// the FST contains (sequence 0; sequence 1; ...).  So reordering is needed
+  /// when doing the numerator computation.
+  /// We order 'indexes' in this way for efficiency in the denominator
+  /// computation (it helps memory locality), as well as to avoid the need for
+  /// the nnet to reorder things internally to match the requested output
+  /// (for layers inside the neural net, the ordering is (frame 0; frame 1 ...)
+  /// as this corresponds to the order you get when you sort a vector of Index).
   std::vector<Index> indexes;
 
 
@@ -101,8 +105,8 @@ struct NnetChainSupervision {
   bool operator == (const NnetChainSupervision &other) const;
 };
 
-/// NnetChainExample is like NnetExample, but specialized for CTC training.
-/// (actually CCTC training, which is our extension of CTC).
+/// NnetChainExample is like NnetExample, but specialized for
+/// lattice-free (chain) training.
 struct NnetChainExample {
 
   /// 'inputs' contains the input to the network-- normally just it has just one
@@ -110,7 +114,7 @@ struct NnetChainExample {
   /// "ivector")...  this depends on the setup.
   std::vector<NnetIo> inputs;
 
-  /// 'outputs' contains the CTC output supervision.  There will normally
+  /// 'outputs' contains the chain output supervision.  There will normally
   /// be just one member with name == "output".
   std::vector<NnetChainSupervision> outputs;
 
@@ -188,6 +192,15 @@ void MergeChainExamples(bool compress,
 void ShiftChainExampleTimes(int32 frame_shift,
                            const std::vector<std::string> &exclude_names,
                            NnetChainExample *eg);
+
+/**
+   This sets to zero any elements of 'egs->outputs[*].deriv_weights' that correspond
+   to frames within the first or last 'truncate' frames of the sequence (e.g. you could
+   set 'truncate=5' to set zero deriv-weight for the first and last 5 frames of the
+   sequence).
+ */
+void TruncateDerivWeights(int32 truncate,
+                          NnetChainExample *eg);
 
 /**  This function takes a NnetChainExample and produces a ComputationRequest.
      Assumes you don't want the derivatives w.r.t. the inputs; if you do, you
@@ -268,8 +281,6 @@ class ChainExampleMerger {
                         NnetChainExampleStructureCompare> MapType;
 MapType eg_to_egs_;
 };
-
-
 
 } // namespace nnet3
 } // namespace kaldi

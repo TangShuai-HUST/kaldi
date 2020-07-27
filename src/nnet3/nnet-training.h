@@ -39,10 +39,12 @@ struct NnetTrainerOptions {
   BaseFloat l2_regularize_factor;
   BaseFloat backstitch_training_scale;
   int32 backstitch_training_interval;
+  BaseFloat batchnorm_stats_scale;
   std::string read_cache;
   std::string write_cache;
   bool binary_write_cache;
   BaseFloat max_param_change;
+  std::string objective_scales_str;
   NnetOptimizeOptions optimize_config;
   NnetComputeOptions compute_config;
   CachingOptimizingCompilerOptions compiler_config;
@@ -55,6 +57,7 @@ struct NnetTrainerOptions {
       l2_regularize_factor(1.0),
       backstitch_training_scale(0.0),
       backstitch_training_interval(1),
+      batchnorm_stats_scale(0.8),
       binary_write_cache(true),
       max_param_change(2.0) { }
   void Register(OptionsItf *opts) {
@@ -70,7 +73,7 @@ struct NnetTrainerOptions {
     opts->Register("max-param-change", &max_param_change, "The maximum change in "
                    "parameters allowed per minibatch, measured in Euclidean norm "
                    "over the entire model (change will be clipped to this value)");
-    opts->Register("momentum", &momentum, "momentum constant to apply during "
+    opts->Register("momentum", &momentum, "Momentum constant to apply during "
                    "training (help stabilize update).  e.g. 0.9.  Note: we "
                    "automatically multiply the learning rate by (1-momenum) "
                    "so that the 'effective' learning rate is the same as "
@@ -84,6 +87,10 @@ struct NnetTrainerOptions {
                    " --l2-regularize-factor will be multiplied by the component-level "
                    "l2-regularize values and can be used to correct for effects "
                    "related to parallelization by model averaging.");
+    opts->Register("batchnorm-stats-scale", &batchnorm_stats_scale,
+                   "Factor by which we scale down the accumulated stats of batchnorm "
+                   "layers after processing each minibatch.  Ensure that the final "
+                   "model we write out has batchnorm stats that are fairly fresh.");
     opts->Register("backstitch-training-scale", &backstitch_training_scale,
                    "backstitch training factor. "
                    "if 0 then in the normal training mode. It is referred as "
@@ -92,12 +99,16 @@ struct NnetTrainerOptions {
                    &backstitch_training_interval,
                    "do backstitch training with the specified interval of "
                    "minibatches. It is referred as 'n' in our publications.");
-    opts->Register("read-cache", &read_cache, "the location where we can read "
-                   "the cached computation from");
-    opts->Register("write-cache", &write_cache, "the location where we want to "
-                   "write the cached computation to");
+    opts->Register("read-cache", &read_cache, "The location from which to read "
+                   "the cached computation.");
+    opts->Register("write-cache", &write_cache, "The location to which to write "
+                   "the cached computation.");
     opts->Register("binary-write-cache", &binary_write_cache, "Write "
                    "computation cache in binary mode");
+    opts->Register("objective-scales", &objective_scales_str,
+                   "Objective scales for the outputs specified as "
+                   "a comma-separated list of pairs "
+                   "<output-0>:<scale-0>,<output-1>:<scale-1>...");
 
     // register the optimization options with the prefix "optimization".
     ParseOptions optimization_opts("optimization", opts);
@@ -110,6 +121,39 @@ struct NnetTrainerOptions {
   }
 };
 
+// This struct is used to store multiple objective function values
+// and do basic operations on all of them.
+struct ObjectiveValues {
+  std::vector<double> objective_values;
+
+  ObjectiveValues() { }
+
+  ObjectiveValues(const std::vector<double> &values):
+    objective_values(values) { }
+ 
+  ObjectiveValues(const std::vector<BaseFloat> &values);
+  
+  int32 Size() const { return objective_values.size(); }
+  void Resize(int32 size);
+
+  void Add(const ObjectiveValues &other); 
+
+  void Scale(BaseFloat scale);
+
+  void InvScale(BaseFloat inv_scale);
+
+  void InvScale(const std::vector<BaseFloat> &inv_scales);
+
+  void Reset() { Scale(0.0); }
+
+  bool IsZero() const;
+
+  double Sum() const;
+
+  std::string Str() const;
+};
+
+
 // This struct is used in multiple nnet training classes for keeping
 // track of objective function values.
 // Also see struct AccuracyInfo, in nnet-diagnostics.h.
@@ -120,20 +164,35 @@ struct ObjectiveFunctionInfo {
                                 // 'current_phase'.
   double tot_weight;
   double tot_objf;
-  double tot_aux_objf;  // An 'auxiliary' objective function that is optional-
-                        // may be used when things like regularization are being
-                        // used.
+ 
+  // A struct used to store 'auxiliary' objective function values
+  // that is optional- may be used when things like regularization are being
+  // used.
+  ObjectiveValues tot_aux_objfs;
 
   double tot_weight_this_phase;
   double tot_objf_this_phase;
-  double tot_aux_objf_this_phase;
+  ObjectiveValues tot_aux_objfs_this_phase;
+
+  CuVector<BaseFloat> deriv_sum;
+  
+  BaseFloat objf_scale;
+  std::vector<BaseFloat> aux_objf_scales;
 
   ObjectiveFunctionInfo():
       current_phase(0),
       minibatches_this_phase(0),
-      tot_weight(0.0), tot_objf(0.0), tot_aux_objf(0.0),
+      tot_weight(0.0), tot_objf(0.0), 
       tot_weight_this_phase(0.0), tot_objf_this_phase(0.0),
-      tot_aux_objf_this_phase(0.0) { }
+      objf_scale(1.0) { }
+
+  ObjectiveFunctionInfo(BaseFloat objf_scale, 
+                        const std::vector<BaseFloat> aux_objf_scales):
+      current_phase(0),
+      minibatches_this_phase(0),
+      tot_weight(0.0), tot_objf(0.0),
+      tot_weight_this_phase(0.0), tot_objf_this_phase(0.0),
+      objf_scale(objf_scale), aux_objf_scales(aux_objf_scales) { }
 
   // This function updates the stats and, if the phase has just changed,
   // prints a message indicating progress.  The phase equals
@@ -144,7 +203,8 @@ struct ObjectiveFunctionInfo {
                    int32 minibatch_counter,
                    BaseFloat this_minibatch_weight,
                    BaseFloat this_minibatch_tot_objf,
-                   BaseFloat this_minibatch_tot_aux_objf = 0.0);
+                   const ObjectiveValues &this_minibatch_tot_aux_objfs
+                      = ObjectiveValues());
 
   // Prints stats for the current phase.
   // Note: 'phase' will normally be this->current_phase + 1, but may under
@@ -203,11 +263,9 @@ class NnetTrainer {
 
   const NnetTrainerOptions config_;
   Nnet *nnet_;
-  Nnet *delta_nnet_;  // Only used if momentum != 0.0 or max-param-change !=
-                      // 0.0.  nnet representing accumulated parameter-change
-                      // (we'd call this gradient_nnet_, but due to
-                      // natural-gradient update, it's better to consider it as
-                      // a delta-parameter nnet.
+  Nnet *delta_nnet_;  // nnet representing parameter-change for this minibatch
+                      // (or, when using momentum, the moving weighted average
+                      // of this).
   CachingOptimizingCompiler compiler_;
 
   // This code supports multiple output layers, even though in the

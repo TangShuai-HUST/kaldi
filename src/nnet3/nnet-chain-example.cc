@@ -31,8 +31,8 @@ void NnetChainSupervision::Write(std::ostream &os, bool binary) const {
   WriteToken(os, binary, name);
   WriteIndexVector(os, binary, indexes);
   supervision.Write(os, binary);
-  WriteToken(os, binary, "<DW>");  // for DerivWeights.  Want to save space.
-  WriteVectorAsChar(os, binary, deriv_weights);
+  WriteToken(os, binary, "<DW2>");
+  deriv_weights.Write(os, binary);
   WriteToken(os, binary, "</NnetChainSup>");
 }
 
@@ -51,8 +51,11 @@ void NnetChainSupervision::Read(std::istream &is, bool binary) {
   ReadToken(is, binary, &token);
   // in the future this back-compatibility code can be reworked.
   if (token != "</NnetChainSup>") {
-    KALDI_ASSERT(token == "<DW>");
-    ReadVectorAsChar(is, binary, &deriv_weights);
+    KALDI_ASSERT(token == "<DW>" || token == "<DW2>");
+    if (token == "<DW>")
+      ReadVectorAsChar(is, binary, &deriv_weights);
+    else
+      deriv_weights.Read(is, binary);
     ExpectToken(is, binary, "</NnetChainSup>");
   }
   CheckDim();
@@ -82,9 +85,10 @@ void NnetChainSupervision::CheckDim() const {
   }
   if (deriv_weights.Dim() != 0) {
     KALDI_ASSERT(deriv_weights.Dim() == indexes.size());
-    KALDI_ASSERT(deriv_weights.Min() >= 0.0 &&
-                 deriv_weights.Max() <= 1.0);
+    KALDI_ASSERT(deriv_weights.Min() >= 0.0);
   }
+  if (supervision.numerator_post_targets.NumRows() > 0)
+    KALDI_ASSERT(indexes.size() == supervision.numerator_post_targets.NumRows());
 }
 
 NnetChainSupervision::NnetChainSupervision(const NnetChainSupervision &other):
@@ -204,15 +208,15 @@ static void MergeSupervision(
   input_supervision.reserve(inputs.size());
   for (int32 n = 0; n < num_inputs; n++)
     input_supervision.push_back(&(inputs[n]->supervision));
-  std::vector<chain::Supervision> output_supervision;
-  bool compactify = true;
-  AppendSupervision(input_supervision,
-                    compactify,
-                    &output_supervision);
-  if (output_supervision.size() != 1)
-    KALDI_ERR << "Failed to merge 'chain' examples-- inconsistent lengths "
-              << "or weights?";
-  output->supervision.Swap(&(output_supervision[0]));
+  chain::Supervision output_supervision;
+  MergeSupervision(input_supervision,
+                   &output_supervision);
+  if (output_supervision.numerator_post_targets.NumRows() > 0)
+    KALDI_ASSERT(output_supervision.frames_per_sequence * output_supervision.num_sequences == output_supervision.numerator_post_targets.NumRows());
+  output->supervision.Swap(&output_supervision);
+
+  if (output->supervision.numerator_post_targets.NumRows() > 0)
+    KALDI_ASSERT(output->supervision.frames_per_sequence * output->supervision.num_sequences == output->supervision.numerator_post_targets.NumRows());
 
   output->indexes.clear();
   output->indexes.reserve(num_indexes);
@@ -287,6 +291,28 @@ void MergeChainExamples(bool compress,
     }
     MergeSupervision(to_merge,
                      &(output->outputs[i]));
+  }
+}
+
+void TruncateDerivWeights(int32 truncate,
+                          NnetChainExample *eg) {
+  for (size_t i = 0; i < eg->outputs.size(); i++) {
+    NnetChainSupervision &supervision = eg->outputs[i];
+    Vector<BaseFloat> &deriv_weights = supervision.deriv_weights;
+    if (deriv_weights.Dim() == 0) {
+      deriv_weights.Resize(supervision.indexes.size());
+      deriv_weights.Set(1.0);
+    }
+    int32 num_sequences = supervision.supervision.num_sequences,
+        frames_per_sequence = supervision.supervision.frames_per_sequence;
+    KALDI_ASSERT(2 * truncate  < frames_per_sequence);
+    for (int32 t = 0; t < truncate; t++)
+      for (int32 s = 0; s < num_sequences; s++)
+        deriv_weights(t * num_sequences + s) = 0.0;
+    for (int32 t = frames_per_sequence - truncate;
+         t < frames_per_sequence; t++)
+      for (int32 s = 0; s < num_sequences; s++)
+        deriv_weights(t * num_sequences + s) = 0.0;
   }
 }
 
@@ -552,8 +578,6 @@ void ChainExampleMerger::Finish() {
   }
   stats_.PrintStats();
 }
-
-
 
 } // namespace nnet3
 } // namespace kaldi

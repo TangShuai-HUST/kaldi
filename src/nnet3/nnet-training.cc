@@ -34,7 +34,8 @@ NnetTrainer::NnetTrainer(const NnetTrainerOptions &config,
   if (config.zero_component_stats)
     ZeroComponentStats(nnet);
   KALDI_ASSERT(config.momentum >= 0.0 &&
-               config.max_param_change >= 0.0);
+               config.max_param_change >= 0.0 &&
+               config.backstitch_training_interval > 0);
   delta_nnet_ = nnet_->Copy();
   ScaleNnet(0.0, delta_nnet_);
   const int32 num_updatable = NumUpdatableComponents(*delta_nnet_);
@@ -61,7 +62,7 @@ void NnetTrainer::Train(const NnetExample &eg) {
   GetComputationRequest(*nnet_, eg, need_model_derivative,
                         config_.store_component_stats,
                         &request);
-  const NnetComputation *computation = compiler_.Compile(request);
+  std::shared_ptr<const NnetComputation> computation = compiler_.Compile(request);
 
   if (config_.backstitch_training_scale > 0.0 &&
       num_minibatches_processed_ % config_.backstitch_training_interval ==
@@ -87,8 +88,11 @@ void NnetTrainer::Train(const NnetExample &eg) {
 
 void NnetTrainer::TrainInternal(const NnetExample &eg,
                                 const NnetComputation &computation) {
+  // note: because we give the 1st arg (nnet_) as a pointer to the
+  // constructor of 'computer', it will use that copy of the nnet to
+  // store stats.
   NnetComputer computer(config_.compute_config, computation,
-                        *nnet_, delta_nnet_);
+                        nnet_, delta_nnet_);
   // give the inputs to the computer object.
   computer.AcceptInputs(*nnet_, eg.io);
   computer.Run();
@@ -106,7 +110,16 @@ void NnetTrainer::TrainInternal(const NnetExample &eg,
   bool success = UpdateNnetWithMaxChange(*delta_nnet_, config_.max_param_change,
       1.0, 1.0 - config_.momentum, nnet_,
       &num_max_change_per_component_applied_, &num_max_change_global_applied_);
-  // Scales deta_nnet
+
+  // Scale down the batchnorm stats (keeps them fresh... this affects what
+  // happens when we use the model with batchnorm test-mode set).
+  ScaleBatchnormStats(config_.batchnorm_stats_scale, nnet_);
+
+  // The following will only do something if we have a LinearComponent
+  // or AffineComponent with orthonormal-constraint set to a nonzero value.
+  ConstrainOrthonormal(nnet_);
+
+  // Scale deta_nnet
   if (success)
     ScaleNnet(config_.momentum, delta_nnet_);
   else
@@ -116,8 +129,11 @@ void NnetTrainer::TrainInternal(const NnetExample &eg,
 void NnetTrainer::TrainInternalBackstitch(const NnetExample &eg,
                                           const NnetComputation &computation,
                                           bool is_backstitch_step1) {
+  // note: because we give the 1st arg (nnet_) as a pointer to the
+  // constructor of 'computer', it will use that copy of the nnet to
+  // store stats.
   NnetComputer computer(config_.compute_config, computation,
-                        *nnet_, delta_nnet_);
+                        nnet_, delta_nnet_);
   // give the inputs to the computer object.
   computer.AcceptInputs(*nnet_, eg.io);
   computer.Run();
@@ -137,21 +153,34 @@ void NnetTrainer::TrainInternalBackstitch(const NnetExample &eg,
     // delta_nnet is scaled by 1 + backstitch_training_scale when added to nnet;
     max_change_scale = 1.0 + config_.backstitch_training_scale;
     scale_adding = 1.0 + config_.backstitch_training_scale;
+    // If relevant, add in the part of the gradient that comes from L2
+    // regularization.  It may not be optimally inefficient to do it on both
+    // passes of the backstitch, like we do here, but it probably minimizes
+    // any harmful interactions with the max-change.
+    ApplyL2Regularization(*nnet_,
+                          1.0 / scale_adding * GetNumNvalues(eg.io, false) *
+                          config_.l2_regularize_factor, delta_nnet_);
   }
-
-  // If relevant, add in the part of the gradient that comes from L2
-  // regularization.  It may not be optimally inefficient to do it on both
-  // passes of the backstitch, like we do here, but it probably minimizes
-  // any harmful interactions with the max-change.
-  ApplyL2Regularization(*nnet_,
-                        scale_adding * GetNumNvalues(eg.io, false) *
-                        config_.l2_regularize_factor,
-                        delta_nnet_);
 
   // Updates the parameters of nnet
   UpdateNnetWithMaxChange(*delta_nnet_, config_.max_param_change,
       max_change_scale, scale_adding, nnet_,
       &num_max_change_per_component_applied_, &num_max_change_global_applied_);
+
+  if (is_backstitch_step1) {
+    // The following will only do something if we have a LinearComponent or
+    // AffineComponent with orthonormal-constraint set to a nonzero value. We
+    // choose to do this only on the 1st backstitch step, for efficiency.
+    ConstrainOrthonormal(nnet_);
+  }
+
+  if (!is_backstitch_step1) {
+    // Scale down the batchnorm stats (keeps them fresh... this affects what
+    // happens when we use the model with batchnorm test-mode set).  Do this
+    // after backstitch step 2 so that the stats are scaled down before we start
+    // the next minibatch.
+    ScaleBatchnormStats(config_.batchnorm_stats_scale, nnet_);
+  }
 
   ScaleNnet(0.0, delta_nnet_);
 }
@@ -237,13 +266,90 @@ void NnetTrainer::PrintMaxChangeStats() const {
               << " \% of the time.";
 }
 
+ObjectiveValues::ObjectiveValues(const std::vector<BaseFloat> &values) {
+  for (std::vector<BaseFloat>::const_iterator it = values.begin();
+       it != values.end(); ++it) {
+    objective_values.push_back(*it);
+  }
+}
+
+void ObjectiveValues::Resize(int32 size) {
+  objective_values.clear();
+  objective_values.resize(size); 
+}
+
+void ObjectiveValues::Add(const ObjectiveValues &other) {
+  if (Size() == 0) {
+    Resize(other.Size());
+  }
+
+  if (Size() != other.Size()) {
+    KALDI_ERR << "objective values must have same size.";
+  }
+  
+  for (size_t i = 0; i < Size(); i++) {
+    objective_values[i] += other.objective_values[i];
+  }
+}
+
+void ObjectiveValues::Scale(BaseFloat scale) {
+  for (std::vector<double>::iterator it = objective_values.begin();
+       it != objective_values.end(); ++it)
+    *it *= scale;
+}
+
+void ObjectiveValues::InvScale(BaseFloat inv_scale) {
+  for (std::vector<double>::iterator it = objective_values.begin();
+       it != objective_values.end(); ++it) {
+    if (inv_scale != 0.0)
+      *it /= inv_scale;
+    else 
+      KALDI_ASSERT(*it == 0.0);
+  }
+}
+
+void ObjectiveValues::InvScale(const std::vector<BaseFloat> &inv_scales) {
+  KALDI_ASSERT(objective_values.size() == inv_scales.size());
+  for (size_t i = 0; i < objective_values.size(); i++) {
+    if (inv_scales[i] != 0.0) 
+      objective_values[i] /= inv_scales[i];
+    else
+      KALDI_ASSERT(objective_values[i] == 0.0);
+  }
+}
+
+bool ObjectiveValues::IsZero() const {
+  for (std::vector<double>::const_iterator it = objective_values.begin();
+       it != objective_values.end(); ++it) {
+    if (*it != 0.0) return false;
+  }
+  return true;
+}
+
+double ObjectiveValues::Sum() const {
+  double sum = 0.0;
+  for (std::vector<double>::const_iterator it = objective_values.begin();
+       it != objective_values.end(); ++it) {
+    sum += *it;
+  }
+  return sum;
+}
+
+std::string ObjectiveValues::Str() const {
+  std::ostringstream oss;
+  for (size_t i = 0; i < Size(); i++) {
+    oss << objective_values[i] << (i < Size() - 1 ? " + " : "");
+  }
+  return oss.str();
+}
+
 void ObjectiveFunctionInfo::UpdateStats(
     const std::string &output_name,
     int32 minibatches_per_phase,
     int32 minibatch_counter,
     BaseFloat this_minibatch_weight,
     BaseFloat this_minibatch_tot_objf,
-    BaseFloat this_minibatch_tot_aux_objf) {
+    const ObjectiveValues &this_minibatch_tot_aux_objfs) {
   int32 phase = minibatch_counter / minibatches_per_phase;
   if (phase != current_phase) {
     KALDI_ASSERT(phase > current_phase);
@@ -252,16 +358,16 @@ void ObjectiveFunctionInfo::UpdateStats(
     current_phase = phase;
     tot_weight_this_phase = 0.0;
     tot_objf_this_phase = 0.0;
-    tot_aux_objf_this_phase = 0.0;
+    tot_aux_objfs_this_phase.Reset();
     minibatches_this_phase = 0;
   }
   minibatches_this_phase++;
   tot_weight_this_phase += this_minibatch_weight;
   tot_objf_this_phase += this_minibatch_tot_objf;
-  tot_aux_objf_this_phase += this_minibatch_tot_aux_objf;
+  tot_aux_objfs_this_phase.Add(this_minibatch_tot_aux_objfs);
   tot_weight += this_minibatch_weight;
   tot_objf += this_minibatch_tot_objf;
-  tot_aux_objf += this_minibatch_tot_aux_objf;
+  tot_aux_objfs.Add(this_minibatch_tot_aux_objfs);
 }
 
 void ObjectiveFunctionInfo::PrintStatsForThisPhase(
@@ -271,7 +377,7 @@ void ObjectiveFunctionInfo::PrintStatsForThisPhase(
   int32 start_minibatch = current_phase * minibatches_per_phase,
       end_minibatch = phase * minibatches_per_phase - 1;
 
-  if (tot_aux_objf_this_phase == 0.0) {
+  if (tot_aux_objfs_this_phase.IsZero()) {
     if (minibatches_per_phase == minibatches_this_phase) {
       KALDI_LOG << "Average objective function for '" << output_name
                 << "' for minibatches " << start_minibatch
@@ -287,41 +393,56 @@ void ObjectiveFunctionInfo::PrintStatsForThisPhase(
                 << tot_weight_this_phase << " frames.";
     }
   } else {
-    BaseFloat objf = (tot_objf_this_phase / tot_weight_this_phase),
-        aux_objf = (tot_aux_objf_this_phase / tot_weight_this_phase),
-        sum_objf = objf + aux_objf;
+    BaseFloat objf = (tot_objf_this_phase / tot_weight_this_phase);
+    ObjectiveValues aux_objfs(tot_aux_objfs_this_phase);
+    aux_objfs.Scale(1.0 / tot_weight_this_phase);
+    BaseFloat sum_objf = objf + aux_objfs.Sum();
     if (minibatches_per_phase == minibatches_this_phase) {
       KALDI_LOG << "Average objective function for '" << output_name
                 << "' for minibatches " << start_minibatch
                 << '-' << end_minibatch << " is "
-                << objf << " + " << aux_objf << " = " << sum_objf
+                << objf << " + " << aux_objfs.Str() << " = " << sum_objf
                 << " over " << tot_weight_this_phase << " frames.";
     } else {
       KALDI_LOG << "Average objective function for '" << output_name
                 << "' using " << minibatches_this_phase
                 << " minibatches in  minibatch range " << start_minibatch
                 << '-' << end_minibatch << " is "
-                << objf << " + " << aux_objf << " = " << sum_objf
+                << objf << " + " << aux_objfs.Str() << " = " << sum_objf
                 << " over " << tot_weight_this_phase << " frames.";
     }
   }
 }
 
 bool ObjectiveFunctionInfo::PrintTotalStats(const std::string &name) const {
-  BaseFloat objf = (tot_objf / tot_weight),
-        aux_objf = (tot_aux_objf / tot_weight),
-        sum_objf = objf + aux_objf;
-  if (tot_aux_objf == 0.0) {
+  BaseFloat objf = (tot_objf / tot_weight);
+  ObjectiveValues aux_objfs(tot_aux_objfs);
+  aux_objfs.Scale(1.0 / tot_weight);
+  BaseFloat sum_objf = objf + aux_objfs.Sum();
+
+  // Remove scales for the purpose of printing
+  if (objf_scale != 0.0) objf /= objf_scale;
+  aux_objfs.InvScale(aux_objf_scales);
+
+  if (tot_aux_objfs.IsZero()) {
     KALDI_LOG << "Overall average objective function for '" << name << "' is "
-              << (tot_objf / tot_weight) << " over " << tot_weight << " frames.";
+              << objf << " over " << tot_weight << " frames.";
   } else {
     KALDI_LOG << "Overall average objective function for '" << name << "' is "
-              << objf << " + " << aux_objf << " = " << sum_objf
+              << objf << " + " << aux_objfs.Str() << " = " << sum_objf
               << " over " << tot_weight << " frames.";
   }
+
+  if (deriv_sum.Dim() > 0) {
+    Vector<BaseFloat> deriv_avg(deriv_sum);
+    deriv_avg.Scale(1.0 / tot_weight);
+    KALDI_LOG << "Overall avg deriv for " << name << " is " << deriv_avg;
+  }
+
   KALDI_LOG << "[this line is to be parsed by a script:] "
             << "log-prob-per-frame="
             << objf;
+
   return (tot_weight != 0.0);
 }
 
